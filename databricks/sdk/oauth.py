@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
 import requests.auth
@@ -845,9 +845,11 @@ class ClientCredentials(Refreshable):
     the background job uses the Client ID and Client Secret to obtain
     an Access Token from the Authorization Server.
 
-    If `get_client_credentials` is set, it is called on every refresh and its
-    `(client_id, client_secret)` are used instead of the fields, so that a
-    secret rotated while the process runs is picked up on the next refresh.
+    If `get_client_secret` is set and a token request fails, it is called to
+    re-read the client secret from where it was configured. If the secret has
+    changed (it was rotated while the process runs), the request is retried
+    once with the new secret, which is kept for later refreshes. The client ID
+    is never changed.
     """
 
     client_id: str
@@ -859,7 +861,7 @@ class ClientCredentials(Refreshable):
     use_header: bool = False
     disable_async: bool = True
     authorization_details: str = None
-    get_client_credentials: Optional[Callable[[], Tuple[str, str]]] = None
+    get_client_secret: Optional[Callable[[], Optional[str]]] = None
 
     def __post_init__(self):
         super().__init__(disable_async=self.disable_async)
@@ -873,11 +875,22 @@ class ClientCredentials(Refreshable):
         if self.endpoint_params:
             for k, v in self.endpoint_params.items():
                 params[k] = v
-        client_id, client_secret = self.client_id, self.client_secret
-        if self.get_client_credentials is not None:
-            client_id, client_secret = self.get_client_credentials()
+        try:
+            return self._retrieve_token(self.client_secret, dict(params))
+        except ValueError:
+            if self.get_client_secret is None:
+                raise
+            client_secret = self.get_client_secret()
+            if not client_secret or client_secret == self.client_secret:
+                raise
+        logger.debug("Retrying the token request for %s with a rotated client secret", self.client_id)
+        token = self._retrieve_token(client_secret, params)
+        self.client_secret = client_secret
+        return token
+
+    def _retrieve_token(self, client_secret: str, params: dict) -> Token:
         return retrieve_token(
-            client_id,
+            self.client_id,
             client_secret,
             self.token_url,
             params,

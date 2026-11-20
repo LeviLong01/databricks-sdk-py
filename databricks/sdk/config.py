@@ -832,9 +832,10 @@ class Config:
     def _reload_from_source(self, *names: str) -> None:
         """Re-read the named attributes from the environment variable or config file they were loaded from.
 
-        Credentials such as a client secret can be rotated while a process runs. Calling this before
-        a token refresh lets the refresh use the current value. Attributes passed to the constructor
-        are never changed, and an attribute keeps its current value if its source no longer has one.
+        Credentials such as a client secret can be rotated while a process runs. OAuth providers call
+        this after a token request fails, to pick up the current value. Attributes passed to the
+        constructor are never changed, and an attribute keeps its current value if its source no
+        longer has one.
         """
         for name in names:
             source = self._attribute_sources.get(name)

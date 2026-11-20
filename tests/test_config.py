@@ -1094,6 +1094,10 @@ _ROTATION_HOST = "https://test.databricks.com"
 _ROTATION_TOKEN_URL = f"{_ROTATION_HOST}/oidc/v1/token"
 
 
+def _basic_auth_secret(request):
+    return base64.b64decode(request.headers["Authorization"].removeprefix("Basic ")).decode().split(":", 1)[1]
+
+
 def _mock_m2m_token_endpoint(mocker, requests_mock, valid_secret):
     """Mocks OIDC discovery and a token endpoint that accepts only ``valid_secret["value"]``.
 
@@ -1109,7 +1113,7 @@ def _mock_m2m_token_endpoint(mocker, requests_mock, valid_secret):
     )
 
     def issue_token(request, context):
-        secret = base64.b64decode(request.headers["Authorization"].removeprefix("Basic ")).decode().split(":", 1)[1]
+        secret = _basic_auth_secret(request)
         if secret != valid_secret["value"]:
             context.status_code = 401
             context.headers["Content-Type"] = "application/json"
@@ -1121,7 +1125,7 @@ def _mock_m2m_token_endpoint(mocker, requests_mock, valid_secret):
 
 def test_oauth_m2m_uses_client_secret_rotated_in_environment(mocker, requests_mock, monkeypatch, tmp_path):
     valid_secret = {"value": "secret-v1"}
-    _mock_m2m_token_endpoint(mocker, requests_mock, valid_secret)
+    token_request = _mock_m2m_token_endpoint(mocker, requests_mock, valid_secret)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("DATABRICKS_HOST", _ROTATION_HOST)
     monkeypatch.setenv("DATABRICKS_CLIENT_ID", "client-id")
@@ -1135,6 +1139,13 @@ def test_oauth_m2m_uses_client_secret_rotated_in_environment(mocker, requests_mo
 
     assert cfg.authenticate() == {"Authorization": "Bearer token-for-secret-v2"}
     assert cfg.client_secret == "secret-v2"
+    # One request with the revoked secret, then one retry with the rotated secret.
+    assert [_basic_auth_secret(r) for r in token_request.request_history] == ["secret-v1", "secret-v1", "secret-v2"]
+
+    # Later refreshes use the new secret straight away.
+    assert cfg.authenticate() == {"Authorization": "Bearer token-for-secret-v2"}
+    assert _basic_auth_secret(token_request.last_request) == "secret-v2"
+    assert token_request.call_count == 4
 
 
 def test_oauth_m2m_uses_client_secret_rotated_in_config_file(mocker, requests_mock, monkeypatch, tmp_path):
@@ -1173,16 +1184,77 @@ def test_oauth_m2m_keeps_client_secret_passed_to_constructor(mocker, requests_mo
 
 
 def test_oauth_m2m_keeps_client_secret_when_its_source_is_emptied(mocker, requests_mock, monkeypatch, tmp_path):
-    _mock_m2m_token_endpoint(mocker, requests_mock, {"value": "secret-v1"})
+    valid_secret = {"value": "secret-v1"}
+    token_request = _mock_m2m_token_endpoint(mocker, requests_mock, valid_secret)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("DATABRICKS_HOST", _ROTATION_HOST)
     monkeypatch.setenv("DATABRICKS_CLIENT_ID", "client-id")
     monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "secret-v1")
     cfg = Config(auth_type="oauth-m2m", disable_async_token_refresh=True)
-
     monkeypatch.delenv("DATABRICKS_CLIENT_SECRET")
+    valid_secret["value"] = "secret-v2"
+
+    with pytest.raises(ValueError, match="invalid_client: Client authentication failed"):
+        cfg.authenticate()
+    assert cfg.client_secret == "secret-v1"
+    assert token_request.call_count == 1
+
+
+def test_oauth_m2m_does_not_retry_when_the_secret_is_unchanged(mocker, requests_mock, monkeypatch, tmp_path):
+    valid_secret = {"value": "secret-v1"}
+    token_request = _mock_m2m_token_endpoint(mocker, requests_mock, valid_secret)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("DATABRICKS_HOST", _ROTATION_HOST)
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "client-id")
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "secret-v1")
+    cfg = Config(auth_type="oauth-m2m", disable_async_token_refresh=True)
+    # Revoked, but nothing new was put in its place.
+    valid_secret["value"] = "secret-v2"
+
+    with pytest.raises(ValueError, match="invalid_client: Client authentication failed"):
+        cfg.authenticate()
+    assert token_request.call_count == 1
+
+
+def test_oauth_m2m_working_client_ignores_later_environment_changes(mocker, requests_mock, monkeypatch, tmp_path):
+    token_request = _mock_m2m_token_endpoint(mocker, requests_mock, {"value": "secret-v1"})
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("DATABRICKS_HOST", _ROTATION_HOST)
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "client-id")
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "secret-v1")
+    cfg = Config(auth_type="oauth-m2m", disable_async_token_refresh=True)
+    assert cfg.authenticate() == {"Authorization": "Bearer token-for-secret-v1"}
+
+    # A process can change the environment to configure another client; this one keeps working as before.
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "other-client-id")
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "other-secret")
 
     assert cfg.authenticate() == {"Authorization": "Bearer token-for-secret-v1"}
+    assert cfg.client_id == "client-id"
+    assert cfg.client_secret == "secret-v1"
+    assert token_request.call_count == 2
+
+
+def test_oauth_m2m_never_reloads_the_client_id(mocker, requests_mock, monkeypatch, tmp_path):
+    valid_secret = {"value": "secret-v1"}
+    token_request = _mock_m2m_token_endpoint(mocker, requests_mock, valid_secret)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("DATABRICKS_HOST", _ROTATION_HOST)
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "client-id")
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "secret-v1")
+    cfg = Config(auth_type="oauth-m2m", disable_async_token_refresh=True)
+    valid_secret["value"] = "secret-v2"
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "other-client-id")
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "secret-v2")
+
+    cfg.authenticate()
+
+    client_ids = [
+        base64.b64decode(r.headers["Authorization"].removeprefix("Basic ")).decode().split(":", 1)[0]
+        for r in token_request.request_history
+    ]
+    assert client_ids == ["client-id", "client-id"]
+    assert cfg.client_id == "client-id"
 
 
 def test_azure_client_secret_uses_secret_rotated_in_environment(mocker, requests_mock, monkeypatch, tmp_path):
