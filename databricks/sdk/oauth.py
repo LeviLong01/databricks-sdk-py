@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 import requests.auth
@@ -844,6 +844,10 @@ class ClientCredentials(Refreshable):
     the CI/CD process or any other automated job. In this scenario,
     the background job uses the Client ID and Client Secret to obtain
     an Access Token from the Authorization Server.
+
+    If `get_client_credentials` is set, it is called on every refresh and its
+    `(client_id, client_secret)` are used instead of the fields, so that a
+    secret rotated while the process runs is picked up on the next refresh.
     """
 
     client_id: str
@@ -855,6 +859,7 @@ class ClientCredentials(Refreshable):
     use_header: bool = False
     disable_async: bool = True
     authorization_details: str = None
+    get_client_credentials: Optional[Callable[[], Tuple[str, str]]] = None
 
     def __post_init__(self):
         super().__init__(disable_async=self.disable_async)
@@ -868,9 +873,12 @@ class ClientCredentials(Refreshable):
         if self.endpoint_params:
             for k, v in self.endpoint_params.items():
                 params[k] = v
+        client_id, client_secret = self.client_id, self.client_secret
+        if self.get_client_credentials is not None:
+            client_id, client_secret = self.get_client_credentials()
         return retrieve_token(
-            self.client_id,
-            self.client_secret,
+            client_id,
+            client_secret,
             self.token_url,
             params,
             use_params=self.use_params,

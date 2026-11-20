@@ -301,6 +301,9 @@ class Config:
         """
         self._header_factory = None
         self._inner = {}
+        # Where attributes loaded from the environment or a config file came from, so that
+        # rotatable credentials can be re-read (see `_reload_from_source`).
+        self._attribute_sources: Dict[str, tuple] = {}
         self._user_agent_other_info = []
         self._custom_headers = custom_headers or {}
         self.http_adapter = http_adapter
@@ -737,15 +740,18 @@ class Config:
                 continue
             if attr.name in self._inner:
                 continue
-            value = os.environ.get(attr.env)
+            env_name = attr.env
+            value = os.environ.get(env_name)
             if not value:
                 for alias in attr.env_aliases:
                     value = os.environ.get(alias)
                     if value:
+                        env_name = alias
                         break
             if not value:
                 continue
             self.__setattr__(attr.name, value)
+            self._attribute_sources[attr.name] = ("env", env_name)
             found = True
         if found:
             logger.debug("Loaded from environment")
@@ -819,8 +825,41 @@ class Config:
                 # don't overwrite a value previously set
                 continue
             self.__setattr__(k, v)
+            self._attribute_sources[k] = ("file", config_path, profile)
         if not is_fallback:
             self.profile = profile
+
+    def _reload_from_source(self, *names: str) -> None:
+        """Re-read the named attributes from the environment variable or config file they were loaded from.
+
+        Credentials such as a client secret can be rotated while a process runs. Calling this before
+        a token refresh lets the refresh use the current value. Attributes passed to the constructor
+        are never changed, and an attribute keeps its current value if its source no longer has one.
+        """
+        for name in names:
+            source = self._attribute_sources.get(name)
+            if source is None:
+                continue
+            if source[0] == "env":
+                value = os.environ.get(source[1])
+            else:
+                value = self._read_config_file_value(source[1], source[2], name)
+            if value and value != self._inner.get(name):
+                logger.debug("Reloaded %s from %s", name, source[1] if source[0] == "env" else source[1].name)
+                self.__setattr__(name, value)
+
+    @staticmethod
+    def _read_config_file_value(config_path: pathlib.Path, profile: str, name: str) -> Optional[str]:
+        ini_file = configparser.ConfigParser()
+        try:
+            ini_file.read(config_path)
+        except (configparser.Error, OSError) as e:
+            logger.debug("Could not re-read %s: %s", config_path, e)
+            return None
+        if profile == "DEFAULT":
+            return ini_file.defaults().get(name)
+        # Same private access as `_known_file_config_loader`: values from DEFAULT are not merged in.
+        return ini_file._sections.get(profile, {}).get(name)
 
     def _validate(self):
         auths_used = set()

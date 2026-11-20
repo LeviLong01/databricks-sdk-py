@@ -1,3 +1,4 @@
+import base64
 import os
 import pathlib
 import platform
@@ -1087,3 +1088,131 @@ def test_resolve_host_metadata_falls_back_to_account_id_when_no_token_federation
     config = Config(host=_DUMMY_ACC_HOST, token="t", account_id=_DUMMY_ACCOUNT_ID)
     # No token_federation_default_oidc_audiences and no workspace_id → falls back to account_id
     assert config.token_audience == _DUMMY_ACCOUNT_ID
+
+
+_ROTATION_HOST = "https://test.databricks.com"
+_ROTATION_TOKEN_URL = f"{_ROTATION_HOST}/oidc/v1/token"
+
+
+def _mock_m2m_token_endpoint(mocker, requests_mock, valid_secret):
+    """Mocks OIDC discovery and a token endpoint that accepts only ``valid_secret["value"]``.
+
+    Tokens are issued already expired, so every authenticate() call exchanges the secret again.
+    """
+    mocker.patch(
+        "databricks.sdk.config.get_host_metadata",
+        return_value=HostMetadata(oidc_endpoint=f"{_ROTATION_HOST}/oidc"),
+    )
+    requests_mock.get(
+        f"{_ROTATION_HOST}/oidc/.well-known/oauth-authorization-server",
+        json={"authorization_endpoint": f"{_ROTATION_HOST}/oidc/v1/authorize", "token_endpoint": _ROTATION_TOKEN_URL},
+    )
+
+    def issue_token(request, context):
+        secret = base64.b64decode(request.headers["Authorization"].removeprefix("Basic ")).decode().split(":", 1)[1]
+        if secret != valid_secret["value"]:
+            context.status_code = 401
+            context.headers["Content-Type"] = "application/json"
+            return {"error": "invalid_client", "error_description": "Client authentication failed"}
+        return {"access_token": f"token-for-{secret}", "token_type": "Bearer", "expires_in": -1}
+
+    return requests_mock.post(_ROTATION_TOKEN_URL, json=issue_token)
+
+
+def test_oauth_m2m_uses_client_secret_rotated_in_environment(mocker, requests_mock, monkeypatch, tmp_path):
+    valid_secret = {"value": "secret-v1"}
+    _mock_m2m_token_endpoint(mocker, requests_mock, valid_secret)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("DATABRICKS_HOST", _ROTATION_HOST)
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "client-id")
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "secret-v1")
+    cfg = Config(auth_type="oauth-m2m", disable_async_token_refresh=True)
+    assert cfg.authenticate() == {"Authorization": "Bearer token-for-secret-v1"}
+
+    # The secret is rotated: the old one is revoked and the new one is put where the first came from.
+    valid_secret["value"] = "secret-v2"
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "secret-v2")
+
+    assert cfg.authenticate() == {"Authorization": "Bearer token-for-secret-v2"}
+    assert cfg.client_secret == "secret-v2"
+
+
+def test_oauth_m2m_uses_client_secret_rotated_in_config_file(mocker, requests_mock, monkeypatch, tmp_path):
+    valid_secret = {"value": "secret-v1"}
+    _mock_m2m_token_endpoint(mocker, requests_mock, valid_secret)
+    config_file = tmp_path / ".databrickscfg"
+
+    def write_profile(secret):
+        config_file.write_text(f"[example]\nhost = {_ROTATION_HOST}\nclient_id = client-id\nclient_secret = {secret}\n")
+
+    write_profile("secret-v1")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = Config(profile="example", auth_type="oauth-m2m", disable_async_token_refresh=True)
+    assert cfg.authenticate() == {"Authorization": "Bearer token-for-secret-v1"}
+
+    valid_secret["value"] = "secret-v2"
+    write_profile("secret-v2")
+
+    assert cfg.authenticate() == {"Authorization": "Bearer token-for-secret-v2"}
+
+
+def test_oauth_m2m_keeps_client_secret_passed_to_constructor(mocker, requests_mock, monkeypatch, tmp_path):
+    _mock_m2m_token_endpoint(mocker, requests_mock, {"value": "secret-v1"})
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = Config(
+        host=_ROTATION_HOST,
+        client_id="client-id",
+        client_secret="secret-v1",
+        auth_type="oauth-m2m",
+        disable_async_token_refresh=True,
+    )
+    # An explicit argument always wins over the environment, as it does when the config is created.
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "secret-v2")
+
+    assert cfg.authenticate() == {"Authorization": "Bearer token-for-secret-v1"}
+
+
+def test_oauth_m2m_keeps_client_secret_when_its_source_is_emptied(mocker, requests_mock, monkeypatch, tmp_path):
+    _mock_m2m_token_endpoint(mocker, requests_mock, {"value": "secret-v1"})
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("DATABRICKS_HOST", _ROTATION_HOST)
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "client-id")
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "secret-v1")
+    cfg = Config(auth_type="oauth-m2m", disable_async_token_refresh=True)
+
+    monkeypatch.delenv("DATABRICKS_CLIENT_SECRET")
+
+    assert cfg.authenticate() == {"Authorization": "Bearer token-for-secret-v1"}
+
+
+def test_azure_client_secret_uses_secret_rotated_in_environment(mocker, requests_mock, monkeypatch, tmp_path):
+    host = "https://adb-123.4.azuredatabricks.net"
+    mocker.patch(
+        "databricks.sdk.config.get_host_metadata",
+        return_value=HostMetadata(oidc_endpoint=f"{host}/oidc", cloud=Cloud.AZURE),
+    )
+    valid_secret = {"value": "secret-v1"}
+
+    def issue_token(request, context):
+        secret = parse_qs(request.text)["client_secret"][0]
+        if secret != valid_secret["value"]:
+            context.status_code = 401
+            context.headers["Content-Type"] = "application/json"
+            return {"error": "invalid_client", "error_description": "AADSTS7000215: Invalid client secret provided."}
+        return {"access_token": f"token-for-{secret}", "token_type": "Bearer", "expires_in": -1}
+
+    requests_mock.post("https://login.microsoftonline.com/test-tenant-id/oauth2/token", json=issue_token)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("DATABRICKS_HOST", host)
+    monkeypatch.setenv("ARM_CLIENT_ID", "azure-client-id")
+    monkeypatch.setenv("ARM_CLIENT_SECRET", "secret-v1")
+    monkeypatch.setenv("ARM_TENANT_ID", "test-tenant-id")
+    cfg = Config(auth_type="azure-client-secret", disable_async_token_refresh=True)
+    assert cfg.authenticate()["Authorization"] == "Bearer token-for-secret-v1"
+
+    valid_secret["value"] = "secret-v2"
+    monkeypatch.setenv("ARM_CLIENT_SECRET", "secret-v2")
+
+    headers = cfg.authenticate()
+    assert headers["Authorization"] == "Bearer token-for-secret-v2"
+    assert headers["X-Databricks-Azure-SP-Management-Token"] == "token-for-secret-v2"

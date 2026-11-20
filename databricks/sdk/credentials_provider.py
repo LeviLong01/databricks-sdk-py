@@ -267,6 +267,12 @@ def oauth_service_principal(cfg: "Config") -> Optional[CredentialsProvider]:
         return None
 
     endpoint_params = {"assume_group": cfg.group_id} if cfg.group_id else None
+
+    def client_credentials():
+        # Pick up a secret rotated in the environment or config file since the last refresh.
+        cfg._reload_from_source("client_id", "client_secret")
+        return cfg.client_id, cfg.client_secret
+
     token_source = oauth.ClientCredentials(
         client_id=cfg.client_id,
         client_secret=cfg.client_secret,
@@ -276,6 +282,7 @@ def oauth_service_principal(cfg: "Config") -> Optional[CredentialsProvider]:
         disable_async=cfg.disable_async_token_refresh,
         authorization_details=cfg.authorization_details,
         endpoint_params=endpoint_params,
+        get_client_credentials=client_credentials,
     )
 
     def inner() -> Dict[str, str]:
@@ -388,6 +395,11 @@ def azure_service_principal(cfg: "Config") -> CredentialsProvider:
     to every request, while automatically resolving different Azure environment endpoints.
     """
 
+    def client_credentials():
+        # Pick up a secret rotated in the environment or config file since the last refresh.
+        cfg._reload_from_source("azure_client_id", "azure_client_secret")
+        return cfg.azure_client_id, cfg.azure_client_secret
+
     def token_source_for(resource: str) -> oauth.TokenSource:
         aad_endpoint = cfg.arm_environment.active_directory_endpoint
         return oauth.ClientCredentials(
@@ -399,6 +411,7 @@ def azure_service_principal(cfg: "Config") -> CredentialsProvider:
             disable_async=cfg.disable_async_token_refresh,
             scopes=cfg.get_scopes_as_string(),
             authorization_details=cfg.authorization_details,
+            get_client_credentials=client_credentials,
         )
 
     _ensure_host_present(cfg, token_source_for)
