@@ -1257,6 +1257,30 @@ def test_oauth_m2m_never_reloads_the_client_id(mocker, requests_mock, monkeypatc
     assert cfg.client_id == "client-id"
 
 
+def test_oauth_m2m_rotation_never_reloads_host_or_token_url(mocker, requests_mock, monkeypatch, tmp_path):
+    valid_secret = {"value": "secret-v1"}
+    token_request = _mock_m2m_token_endpoint(mocker, requests_mock, valid_secret)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("DATABRICKS_HOST", _ROTATION_HOST)
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "client-id")
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "secret-v1")
+    cfg = Config(auth_type="oauth-m2m", disable_async_token_refresh=True)
+    assert cfg.authenticate() == {"Authorization": "Bearer token-for-secret-v1"}
+
+    # Whoever changes the environment can't redirect the secret: only the secret is re-read.
+    valid_secret["value"] = "secret-v2"
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "secret-v2")
+    monkeypatch.setenv("DATABRICKS_HOST", "https://attacker.example.com")
+    monkeypatch.setenv(
+        "DATABRICKS_DISCOVERY_URL", "https://attacker.example.com/.well-known/oauth-authorization-server"
+    )
+
+    assert cfg.authenticate() == {"Authorization": "Bearer token-for-secret-v2"}
+    assert cfg.host == _ROTATION_HOST
+    assert {request.url for request in token_request.request_history} == {_ROTATION_TOKEN_URL}
+    assert all(request.hostname == "test.databricks.com" for request in requests_mock.request_history)
+
+
 def test_azure_client_secret_uses_secret_rotated_in_environment(mocker, requests_mock, monkeypatch, tmp_path):
     host = "https://adb-123.4.azuredatabricks.net"
     mocker.patch(
